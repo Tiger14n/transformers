@@ -209,6 +209,123 @@ def _compute_mask_indices(
     return spec_aug_mask
 
 
+
+def rotate_half(x):
+    """Rotates half the hidden dims of the input."""
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+    """Applies Rotary Position Embedding to the query and key tensors.
+
+    Args:
+        q (`torch.Tensor`): The query tensor.
+        k (`torch.Tensor`): The key tensor.
+        cos (`torch.Tensor`): The cosine part of the rotary embedding.
+        sin (`torch.Tensor`): The sine part of the rotary embedding.
+        position_ids (`torch.Tensor`, *optional*):
+            Deprecated and unused.
+        unsqueeze_dim (`int`, *optional*, defaults to 1):
+            The 'unsqueeze_dim' argument specifies the dimension along which to unsqueeze cos[position_ids] and
+            sin[position_ids] so that they can be properly broadcasted to the dimensions of q and k. For example, note
+            that cos[position_ids] and sin[position_ids] have the shape [batch_size, seq_len, head_dim]. Then, if q and
+            k have the shape [batch_size, heads, seq_len, head_dim], then setting unsqueeze_dim=1 makes
+            cos[position_ids] and sin[position_ids] broadcastable to the shapes of q and k. Similarly, if q and k have
+            the shape [batch_size, seq_len, heads, head_dim], then set unsqueeze_dim=2.
+    Returns:
+        `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
+    """
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+from ...modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+class LlamaRotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        dim=None,
+        max_position_embeddings=2048,
+        base=10000,
+        device="cuda",
+        scaling_factor=1.0,
+        rope_type="dynamic",
+        config = None,
+    ):
+        super().__init__()
+        # TODO (joao): remove the `if` below, only used for BC
+        self.rope_kwargs = {}
+
+        logger.warning_once(
+            "`LlamaRotaryEmbedding` can now be fully parameterized by passing the model config through the "
+            "`config` argument. All other arguments will be removed in v4.46"
+        )
+        self.rope_kwargs = {
+            "rope_type": rope_type,
+            "factor": scaling_factor,
+            "dim": dim,
+            "base": base,
+            "max_position_embeddings": max_position_embeddings,
+        }
+        self.rope_type = rope_type
+        self.max_seq_len_cached = max_position_embeddings
+        self.original_max_seq_len = max_position_embeddings
+        
+        self.config = config
+        
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+
+    def _dynamic_frequency_update(self, position_ids, device):
+        """
+        dynamic RoPE layers should recompute `inv_freq` in the following situations:
+        1 - growing beyond the cached sequence length (allow scaling)
+        2 - the current sequence length is in the original scale (avoid losing precision with small sequences)
+        """
+        seq_len = torch.max(position_ids) + 1
+        if seq_len > self.max_seq_len_cached:  # growth
+            inv_freq, self.attention_scaling = self.rope_init_fn(
+                self.config, device, seq_len=seq_len, **self.rope_kwargs
+            )
+            self.register_buffer("inv_freq", inv_freq, persistent=False)  # TODO joao: may break with compilation
+            self.max_seq_len_cached = seq_len
+
+        if seq_len < self.original_max_seq_len and self.max_seq_len_cached > self.original_max_seq_len:  # reset
+            self.register_buffer("inv_freq", self.original_inv_freq, persistent=False)
+            self.max_seq_len_cached = self.original_max_seq_len
+
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+        
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
 class WhisperPositionalEmbedding(nn.Embedding):
     def __init__(self, num_positions: int, embedding_dim: int, padding_idx: Optional[int] = None):
         super().__init__(num_positions, embedding_dim)
@@ -480,7 +597,9 @@ class WhisperSdpaAttention(WhisperAttention):
         layer_head_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        
         """Input shape: Batch x Time x Channel"""
         if output_attentions or layer_head_mask is not None:
             # TODO: Improve this warning with e.g. `model.config._attn_implementation = "manual"` once this is implemented.
@@ -503,8 +622,8 @@ class WhisperSdpaAttention(WhisperAttention):
         is_cross_attention = key_value_states is not None
         bsz, tgt_len, _ = hidden_states.size()
 
-        # get query proj
-        query_states = self._shape(self.q_proj(hidden_states), tgt_len, bsz)
+        query_states = self.q_proj(hidden_states)
+        query_states = query_states.view(bsz, tgt_len, self.num_heads, self.head_dim).transpose(1, 2)
 
         if past_key_value is not None:
             is_updated = past_key_value.is_updated.get(self.layer_idx)
@@ -522,7 +641,12 @@ class WhisperSdpaAttention(WhisperAttention):
             key_states = past_key_value.key_cache[self.layer_idx]
             value_states = past_key_value.value_cache[self.layer_idx]
         else:
-            key_states = self._shape(self.k_proj(current_states), -1, bsz)
+            key_states = self.k_proj(current_states)
+            key_states = key_states.view(bsz, -1, self.num_heads, self.head_dim).transpose(1, 2)
+            if position_embeddings is not None:
+                cos, sin = position_embeddings
+                query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)         
+
             value_states = self._shape(self.v_proj(current_states), -1, bsz)
             if past_key_value is not None:
                 # save all key/value_states to cache to be re-used for fast auto-regressive generation
@@ -566,6 +690,7 @@ class WhisperSdpaAttention(WhisperAttention):
         attn_output = self.out_proj(attn_output)
 
         return attn_output, None, past_key_value
+
 
 
 WHISPER_ATTENTION_CLASSES = {
@@ -690,6 +815,7 @@ class WhisperDecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         use_cache: Optional[bool] = True,
         cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Args:
@@ -720,6 +846,7 @@ class WhisperDecoderLayer(nn.Module):
             layer_head_mask=layer_head_mask,
             output_attentions=output_attentions,
             cache_position=cache_position,
+            position_embeddings=position_embeddings,
         )
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
         hidden_states = residual + hidden_states
@@ -736,6 +863,7 @@ class WhisperDecoderLayer(nn.Module):
                 layer_head_mask=cross_attn_layer_head_mask,
                 past_key_value=past_key_value,
                 output_attentions=output_attentions,
+                position_embeddings=None,
             )
             hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
             hidden_states = residual + hidden_states
@@ -788,6 +916,7 @@ class WhisperPreTrainedModel(PreTrainedModel):
             with torch.no_grad():
                 embed_positions = module.embed_positions.weight
                 embed_positions.copy_(sinusoids(*embed_positions.shape))
+
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """
@@ -956,9 +1085,10 @@ class WhisperEncoder(WhisperPreTrainedModel):
 
         self.conv1 = nn.Conv1d(self.num_mel_bins, embed_dim, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(embed_dim, embed_dim, kernel_size=3, stride=2, padding=1)
-
+        
         self.embed_positions = nn.Embedding(self.max_source_positions, embed_dim)
         self.embed_positions.requires_grad_(False)
+
 
         self.layers = nn.ModuleList([WhisperEncoderLayer(config) for _ in range(config.encoder_layers)])
         self.layer_norm = nn.LayerNorm(config.d_model)
@@ -1028,9 +1158,11 @@ class WhisperEncoder(WhisperPreTrainedModel):
         inputs_embeds = nn.functional.gelu(self.conv2(inputs_embeds))
 
         inputs_embeds = inputs_embeds.permute(0, 2, 1)
+        
         embed_pos = self.embed_positions.weight
 
         hidden_states = inputs_embeds + embed_pos
+        
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
 
         encoder_states = () if output_hidden_states else None
@@ -1064,6 +1196,7 @@ class WhisperEncoder(WhisperPreTrainedModel):
                         output_attentions,
                     )
                 else:
+
                     layer_outputs = encoder_layer(
                         hidden_states,
                         None,
@@ -1107,7 +1240,14 @@ class WhisperDecoder(WhisperPreTrainedModel):
         self.embed_scale = math.sqrt(config.d_model) if config.scale_embedding else 1.0
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model, self.padding_idx)
-        self.embed_positions = WhisperPositionalEmbedding(self.max_target_positions, config.d_model)
+        # Replace positional embedding with rotary
+        self.rotary_emb = LlamaRotaryEmbedding(
+            config.d_model // config.decoder_attention_heads,  # dim per head
+            max_position_embeddings=config.max_target_positions,
+            rope_type=config.rope_type,
+            scaling_factor=config.rotary_scaling_factor,
+        )
+
 
         self.layers = nn.ModuleList(
             [WhisperDecoderLayer(config, layer_idx) for layer_idx in range(config.decoder_layers)]
@@ -1258,18 +1398,14 @@ class WhisperDecoder(WhisperPreTrainedModel):
         if position_ids is None:
             position_ids = cache_position.unsqueeze(0)
 
-        # embed positions
-        if input_ids is not None:
-            positions = self.embed_positions(
-                input_ids, past_key_values_length=past_key_values_length, position_ids=position_ids
-            )
-        else:
-            positions = self.embed_positions(
-                inputs_embeds, past_key_values_length=past_key_values_length, position_ids=position_ids
-            )
+         
 
-        hidden_states = inputs_embeds + positions.to(inputs_embeds.device)
+        
+        hidden_states = inputs_embeds 
         hidden_states = nn.functional.dropout(hidden_states, p=self.dropout, training=self.training)
+        
+        # create position embeddings to be shared across the decoder layers
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
         causal_mask = self._update_causal_mask(
             attention_mask,
@@ -1319,6 +1455,7 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     output_attentions,
                     use_cache,
                     cache_position,
+                    position_embeddings
                 )
             else:
                 layer_outputs = decoder_layer(
@@ -1333,6 +1470,7 @@ class WhisperDecoder(WhisperPreTrainedModel):
                     output_attentions=output_attentions,
                     use_cache=use_cache,
                     cache_position=cache_position,
+                    position_embeddings=position_embeddings
                 )
             hidden_states = layer_outputs[0]
 
@@ -1631,6 +1769,8 @@ class WhisperModel(WhisperPreTrainedModel):
             )
 
         # decoder outputs consists of (dec_features, past_key_value, dec_hidden, dec_attn)
+
+    
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
